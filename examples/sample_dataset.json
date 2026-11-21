@@ -1,0 +1,46 @@
+{
+  "dataset_id": "demo-2026-11",
+  "powder_batches": [
+    { "id": "PB-001", "core_ids": ["CORE-A1"], "note": "钻机 Z01 第一回次" },
+    { "id": "PB-002", "core_ids": ["CORE-A1"], "note": "同一原样重新制粉" },
+    { "id": "PB-003", "core_ids": ["CORE-B2"], "note": "" },
+    { "id": "PB-004", "core_ids": ["CORE-C3", "CORE-C4"], "note": "共磨批，两个原样" }
+  ],
+  "prep_nodes": [
+    { "id": "SP-01", "kind": "split", "upstream": ["PB-001"], "note": "PB-001 分装瓶 1" },
+    { "id": "SP-02", "kind": "split", "upstream": ["PB-001"], "note": "PB-001 分装瓶 2（与 SP-01 同源，重复路径应只计一次）" },
+    { "id": "SP-03", "kind": "split", "upstream": ["SP-02"], "note": "二次分装" },
+    { "id": "MX-01", "kind": "mix", "upstream": ["PB-001", "PB-002"], "note": "两批粉混样" },
+    { "id": "SP-04", "kind": "split", "upstream": ["PB-003"], "note": "" }
+  ],
+  "report_pairs": [
+    {
+      "id": "RP-01",
+      "report_a": "RPT-2026-1001",
+      "report_b": "RPT-2026-1001-R",
+      "sample_a": "SP-01",
+      "sample_b": "SP-03"
+    },
+    {
+      "id": "RP-02",
+      "report_a": "RPT-2026-1002",
+      "report_b": "RPT-2026-1002-R",
+      "sample_a": "PB-001",
+      "sample_b": "PB-002"
+    },
+    {
+      "id": "RP-03",
+      "report_a": "RPT-2026-1003",
+      "report_b": "RPT-2026-1003-R",
+      "sample_a": "MX-01",
+      "sample_b": "SP-04"
+    },
+    {
+      "id": "RP-04",
+      "report_a": "RPT-2026-1004",
+      "report_b": "RPT-2026-1004-R",
+      "sample_a": "PB-004",
+      "sample_b": "PB-003"
+    }
+  ]
+}

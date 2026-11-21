@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section>
+  <h2>1. 上传数据集 JSON</h2>
+  <p class="muted">
+    JSON 结构：<code>powder_batches</code>（制粉批：id、core_ids 岩芯原样号）、
+    <code>prep_nodes</code>（分装 split/混样 mix：id、upstream 上游粉样 id 列表）、
+    <code>report_pairs</code>（待核查报告对：id、report_a/b、sample_a/b 样号）。
+    重复上传将整库换版，确认记录会重置。
+  </p>
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="inline">
+    <input type="file" name="dataset" accept=".json,application/json" required>
+    <button type="submit">上传并装载</button>
+  </form>
+</section>
+
+<section>
+  <h2>2. 制粉批（岩芯原样 → 粉批）</h2>
+  {% if inventory.batches %}
+  <table>
+    <tr><th>制粉批号</th><th>岩芯原样号</th><th>备注</th></tr>
+    {% for b in inventory.batches %}
+    <tr>
+      <td><code>{{ b.id }}</code></td>
+      <td class="tag-cell">{% for c in b.core_ids %}<code>{{ c }}</code> {% endfor %}</td>
+      <td class="muted">{{ b.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无数据，请先上传 JSON。</p>{% endif %}
+</section>
+
+<section>
+  <h2>3. 分装 / 混样（上游粉样来源）</h2>
+  {% if inventory.nodes %}
+  <table>
+    <tr><th>节点号</th><th>类型</th><th>上游粉样 / 节点</th><th>备注</th></tr>
+    {% for n in inventory.nodes %}
+    <tr>
+      <td><code>{{ n.id }}</code></td>
+      <td>{{ '分装 split' if n.kind == 'split' else '混样 mix' }}</td>
+      <td class="tag-cell">{% for u in n.upstream %}<code>{{ u }}</code> {% endfor %}</td>
+      <td class="muted">{{ n.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无数据。</p>{% endif %}
+
+  <details>
+    <summary>更正分装 / 混样来源（断链或成环将被拒绝，原记录留痕）</summary>
+    <form method="post" id="correct-form">
+      <table style="margin-top:10px">
+        <tr>
+          <th style="width:160px">节点号</th>
+          <td>
+            <select name="node_id" required onchange="fillUpstream(this.value)">
+              <option value="">请选择…</option>
+              {% for n in inventory.nodes %}<option value="{{ n.id }}">{{ n.id }}（{{ n.kind }}）</option>{% endfor %}
+            </select>
+          </td>
+        </tr>
+        <tr>
+          <th>新上游（JSON 数组）</th>
+          <td><input type="text" name="new_upstream" id="new_upstream" placeholder='例如 ["PB-001","PB-002"]' required></td>
+        </tr>
+        <tr>
+          <th>操作人</th><td><input type="text" name="operator" placeholder="质控员姓名"></td>
+        </tr>
+        <tr>
+          <th>更正原因</th><td><textarea name="reason" rows="2"></textarea></td>
+        </tr>
+      </table>
+      <p style="margin-top:10px">
+        <button type="submit" formaction="" id="correct-btn">提交更正</button>
+      </p>
+    </form>
+  </details>
+</section>
+
+<section>
+  <h2>4. 待核查报告对（两侧追溯，重复路径只计一次）</h2>
+  <div class="sticky-note">
+    分类规则：两侧都只来自<b>同一原样</b>且共用<b>唯一制粉批</b> → 同粉复测；
+    各自只用一个制粉批且批号不同 → 独立制样；其余 → 待核。
+    来源更正后，任一侧原样或制粉批集合变化，确认自动撤回；来源未变的确认继续有效；改回原来源也须重新确认。
+  </div>
+  {% if pairs %}
+  <table>
+    <tr>
+      <th>报告对</th>
+      <th>报告 / 样号</th>
+      <th>追溯到的原样与制粉批</th>
+      <th>分类</th>
+      <th>确认状态</th>
+      <th>操作</th>
+    </tr>
+    {% for p in pairs %}
+    <tr>
+      <td><code>{{ p.id }}</code></td>
+      <td class="tag-cell">
+        A：{{ p.report_a or '—' }}<br>样号 <code>{{ p.sample_a }}</code>
+        <hr class="small">
+        B：{{ p.report_b or '—' }}<br>样号 <code>{{ p.sample_b }}</code>
+      </td>
+      <td class="tag-cell">
+        {% if p.trace_error %}
+          <span class="badge pending">追溯失败：{{ p.trace_error }}</span>
+        {% else %}
+          <b>A 侧</b><br>
+          原样：{% for c in p.side_a.cores %}<code>{{ c }}</code> {% endfor %}<br>
+          粉批：{% for b in p.side_a.batches %}<code>{{ b }}</code> {% endfor %}
+          <hr class="small">
+          <b>B 侧</b><br>
+          原样：{% for c in p.side_b.cores %}<code>{{ c }}</code> {% endfor %}<br>
+          粉批：{% for b in p.side_b.batches %}<code>{{ b }}</code> {% endfor %}
+        {% endif %}
+      </td>
+      <td>
+        <span class="badge {{ p.classification }}">{{ p.classification_label }}</span>
+        <div class="muted small" style="margin-top:4px">{{ p.reason }}</div>
+      </td>
+      <td>
+        {% if p.confirmation %}
+          {% if p.confirmation.stale %}
+            <span class="badge stale">确认已失效（来源变动，需重新确认）</span>
+          {% else %}
+            <span class="badge confirmed">已确认：{{ p.confirmation.kind_label }}</span>
+          {% endif %}
+          <div class="muted small" style="margin-top:4px">
+            {{ p.confirmation.confirmed_by }}<br>{{ p.confirmation.confirmed_at }}
+          </div>
+        {% else %}
+          <span class="badge none">未确认</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if p.classification in ['same_powder','independent'] and not p.trace_error %}
+        <form method="post" action="{{ url_for('confirm', pair_id=p.id) }}" class="inline">
+          <input type="hidden" name="data_version" value="{{ meta.data_version }}">
+          <input type="text" name="actor" placeholder="确认人" style="width:110px; margin-bottom:6px">
+          <br><button type="submit">按所见来源确认</button>
+        </form>
+        {% else %}
+        <button disabled title="仅同粉复测/独立制样可确认">不可确认</button>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无报告对。</p>{% endif %}
+</section>
+
+<section>
+  <h2>5. 审计留痕</h2>
+  <h3 class="small">来源更正记录（原记录保留）</h3>
+  {% if events.corrections %}
+  <table>
+    <tr><th>时间</th><th>节点</th><th>原上游</th><th>更正后上游</th><th>原因</th><th>操作人</th></tr>
+    {% for c in events.corrections %}
+    <tr>
+      <td class="small">{{ c.created_at }}</td>
+      <td><code>{{ c.node_id }}</code></td>
+      <td class="tag-cell">{% for u in c.old_upstream %}<code>{{ u }}</code> {% endfor %}</td>
+      <td class="tag-cell">{% for u in c.new_upstream %}<code>{{ u }}</code> {% endfor %}</td>
+      <td class="small">{{ c.reason }}</td>
+      <td class="small">{{ c.operator }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无更正。</p>{% endif %}
+
+  <h3 class="small" style="margin-top:16px">确认 / 撤回事件</h3>
+  {% if events.events %}
+  <table>
+    <tr><th>时间</th><th>报告对</th><th>动作</th><th>分类</th><th>操作人</th><th>原因</th></tr>
+    {% for e in events.events %}
+    <tr>
+      <td class="small">{{ e.created_at }}</td>
+      <td><code>{{ e.pair_id }}</code></td>
+      <td>{{ '确认' if e.action == 'confirm' else '撤回' }}</td>
+      <td>{{ e.kind or '—' }}</td>
+      <td class="small">{{ e.actor }}</td>
+      <td class="small">{{ e.reason }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无确认事件。</p>{% endif %}
+</section>
+
+<script>
+const upstreamMap = {
+  {% for n in inventory.nodes %}"{{ n.id }}": {{ n.upstream | tojson }}{% if not loop.last %},{% endif %}
+  {% endfor %}
+};
+function fillUpstream(id) {
+  const input = document.getElementById('new_upstream');
+  if (id && upstreamMap[id]) input.value = JSON.stringify(upstreamMap[id]);
+}
+const form = document.getElementById('correct-form');
+if (form) {
+  form.addEventListener('submit', (e) => {
+    const nodeId = form.querySelector('[name=node_id]').value;
+    if (!nodeId) { e.preventDefault(); alert('请选择要更正的节点'); return; }
+    form.action = '/nodes/' + encodeURIComponent(nodeId) + '/correct';
+  });
+}
+</script>
+{% endblock %}

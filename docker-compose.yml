@@ -1,0 +1,16 @@
+services:
+  prepcheck:
+    build: .
+    image: prepcheck:latest
+    container_name: prepcheck
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /app/data/prepcheck.db
+      SECRET_KEY: change-me-in-production
+    volumes:
+      - prepcheck-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  prepcheck-data:
