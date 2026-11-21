@@ -253,6 +253,26 @@ def test_upload_bad_json_rejected(client):
     assert "JSON 解析或校验失败" in resp.get_data(as_text=True)
 
 
+def test_reupload_bumps_version_so_old_page_confirm_is_rejected(client, db_path):
+    """整库换版后版号必须递增，否则换版前打开的页面会用相同版号确认新数据。"""
+    conn = get_db(db_path)
+    before = services.get_meta(conn)["data_version"]
+    conn.close()
+    new_payload = {
+        "dataset_id": "v2",
+        "powder_batches": [{"id": "X1", "core_ids": ["K1"]}],
+        "prep_nodes": [],
+        "report_pairs": [{"id": "P1", "sample_a": "X1", "sample_b": "X1"}],
+    }
+    data = {"dataset": (io.BytesIO(json.dumps(new_payload).encode()), "v2.json", "application/json")}
+    client.post("/upload", data=data, content_type="multipart/form-data", follow_redirects=True)
+    resp = client.post("/api/pairs/P1/confirm", json={"confirmed_by": "QC1", "data_version": before})
+    assert resp.status_code == 409
+    ok = client.post("/api/pairs/P1/confirm",
+                     json={"confirmed_by": "QC1", "data_version": before + 1})
+    assert ok.status_code == 200
+
+
 def test_upload_rejects_dangling_upstream(client):
     bad = dict(SAMPLE)
     bad = json.loads(json.dumps(SAMPLE))
@@ -291,4 +311,45 @@ def test_legacy_cycle_can_be_repaired_by_correction(tmp_path):
     pairs = services.list_pairs(conn)
     assert pairs[0]["trace_error"] is None
     assert pairs[0]["classification"] == "same_powder"
+    conn.close()
+
+
+def test_unrelated_broken_pair_keeps_confirmation_during_correction(tmp_path):
+    """与更正节点无关的异常报告对不得被误判为受影响，其确认须保留。"""
+    p = str(tmp_path / "mixed.db")
+    load_dataset(p, {
+        "dataset_id": "mixed",
+        "powder_batches": [
+            {"id": "B1", "core_ids": ["K1"]},
+            {"id": "B2", "core_ids": ["K2"]},
+            {"id": "B3", "core_ids": ["K3"]},
+        ],
+        "prep_nodes": [
+            {"id": "N1", "kind": "split", "upstream": ["B1"]},
+            # 与 N1 无关的坏数据：环 R1 <-> R2
+            {"id": "C1", "kind": "split", "upstream": ["C2"]},
+            {"id": "C2", "kind": "split", "upstream": ["C1"]},
+        ],
+        "report_pairs": [
+            {"id": "GOOD", "sample_a": "B2", "sample_b": "B3"},
+            {"id": "BAD", "sample_a": "C1", "sample_b": "B2"},
+        ],
+    })
+    conn = get_db(p)
+    # 模拟一条历史确认：先合法确认 GOOD，再植入一笔“坏对”的旧确认（存量遗留）
+    assert services.confirm_pair(conn, "GOOD", "QC1", 1)["ok"] is True
+    conn.execute(
+        "INSERT INTO confirmation (pair_id, kind, confirmed_by, confirmed_at, snapshot) "
+        "VALUES ('BAD', 'independent', 'QC0', 'old', ?)",
+        ('{"a": {"cores": ["K1"], "batches": ["B1"]}, "b": {"cores": ["K2"], "batches": ["B2"]}}',),
+    )
+    conn.commit()
+
+    # 更正 N1：与 GOOD / BAD 的样号均无关
+    result = services.correct_upstream(conn, "N1", ["B2"], "QC2", "与两对无关")
+    assert result["revoked_confirmations"] == []
+    assert {p["id"]: p for p in services.list_pairs(conn)}["GOOD"]["confirmation"] is not None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM confirmation WHERE pair_id = 'BAD'"
+    ).fetchone()[0] == 1
     conn.close()

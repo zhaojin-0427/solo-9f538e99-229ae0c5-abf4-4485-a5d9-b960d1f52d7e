@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 
 from flask import (
     Flask,
@@ -15,7 +16,7 @@ from flask import (
 )
 
 from . import services
-from .db import get_db, init_db, load_dataset
+from .db import get_db, init_db, load_dataset, read_snapshot
 from .tracing import TraceError
 
 
@@ -25,7 +26,8 @@ def create_app(db_path: str | None = None) -> Flask:
     app.config["DB_PATH"] = db_path or os.environ.get(
         "DB_PATH", os.path.join(os.getcwd(), "data", "prepcheck.db")
     )
-    os.makedirs(os.path.dirname(app.config["DB_PATH"]), exist_ok=True)
+    db_dir = os.path.dirname(os.path.abspath(app.config["DB_PATH"]))
+    os.makedirs(db_dir, exist_ok=True)
     init_db(app.config["DB_PATH"])
 
     def conn():
@@ -36,10 +38,13 @@ def create_app(db_path: str | None = None) -> Flask:
     def index():
         db = conn()
         try:
-            meta = services.get_meta(db)
-            inventory = services.list_inventory(db)
-            pairs = services.list_pairs(db)
-            events = services.list_events(db)
+            # 一次一致性快照：来源、版号、确认与审计来自同一提交点，
+            # 不会出现「已显示新来源却仍列着新来源下的确认」这类拼接状态。
+            with read_snapshot(db):
+                meta = services.get_meta(db)
+                inventory = services.list_inventory(db)
+                pairs = services.list_pairs(db)
+                events = services.list_events(db)
         finally:
             db.close()
         return render_template(
@@ -76,15 +81,15 @@ def create_app(db_path: str | None = None) -> Flask:
     def confirm(pair_id):
         actor = (request.form.get("actor") or "").strip() or "质控员"
         raw_version = request.form.get("data_version")
-        try:
-            client_version = int(raw_version) if raw_version else None
-        except ValueError:
-            client_version = None
         db = conn()
         try:
-            services.confirm_pair(db, pair_id, actor, client_version)
+            services.confirm_pair(
+                db, pair_id, actor, services.coerce_data_version(raw_version)
+            )
         except services.StalePageError as exc:
             flash(f"旧页面确认被拒绝：{exc}", "error")
+        except sqlite3.OperationalError:
+            flash("数据库正忙，本次确认未写入，请刷新后重试", "error")
         except TraceError as exc:
             flash(f"确认失败：{exc}", "error")
         else:
@@ -112,6 +117,9 @@ def create_app(db_path: str | None = None) -> Flask:
         except (json.JSONDecodeError, ValueError) as exc:
             flash(f"更正被拒绝：{exc}", "error")
             return redirect(url_for("index"))
+        except sqlite3.OperationalError:
+            flash("数据库正忙，本次更正未写入，请刷新后重试", "error")
+            return redirect(url_for("index"))
         revoked = result["revoked_confirmations"]
         flash(
             f"节点 {node_id} 来源已更正并留痕；"
@@ -125,11 +133,12 @@ def create_app(db_path: str | None = None) -> Flask:
     def api_pairs():
         db = conn()
         try:
-            return jsonify({
-                "meta": services.get_meta(db),
-                "pairs": services.list_pairs(db),
-                "inventory": services.list_inventory(db),
-            })
+            with read_snapshot(db):
+                return jsonify({
+                    "meta": services.get_meta(db),
+                    "pairs": services.list_pairs(db),
+                    "inventory": services.list_inventory(db),
+                })
         finally:
             db.close()
 
@@ -142,10 +151,12 @@ def create_app(db_path: str | None = None) -> Flask:
                 result = services.confirm_pair(
                     db, pair_id,
                     body.get("confirmed_by", "质控员"),
-                    body.get("data_version"),
+                    services.coerce_data_version(body.get("data_version")),
                 )
             except services.StalePageError as exc:
                 return jsonify({"error": str(exc), "current_version": exc.current_version}), 409
+            except sqlite3.OperationalError:
+                return jsonify({"error": "数据库正忙，请稍后重试"}), 503
             except TraceError as exc:
                 return jsonify({"error": str(exc)}), 400
             return jsonify(result)
@@ -157,8 +168,10 @@ def create_app(db_path: str | None = None) -> Flask:
         body = request.get_json(silent=True) or {}
         try:
             new_upstream = body["new_upstream"]
-            if not isinstance(new_upstream, list):
-                raise ValueError("new_upstream 必须为数组")
+            if not isinstance(new_upstream, list) or not all(
+                isinstance(x, str) for x in new_upstream
+            ):
+                raise ValueError("new_upstream 必须为字符串 id 的数组")
         except (KeyError, ValueError) as exc:
             return jsonify({"error": str(exc)}), 400
         db = conn()
@@ -171,6 +184,8 @@ def create_app(db_path: str | None = None) -> Flask:
                 )
             except TraceError as exc:
                 return jsonify({"error": str(exc)}), 400
+            except sqlite3.OperationalError:
+                return jsonify({"error": "数据库正忙，请稍后重试"}), 503
             return jsonify(result)
         finally:
             db.close()
